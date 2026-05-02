@@ -25,6 +25,7 @@ steps:
 - **Setup** commands run sequentially before any steps are displayed
 - **Teardown** commands run sequentially after all steps complete
 - Both run with stdin, stdout, and stderr redirected to `/dev/null`
+- Both inherit any global [`env:`](environment.md) values you have set
 - If a setup or teardown command fails, a warning is printed to stderr but
   execution continues
 

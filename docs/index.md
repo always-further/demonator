@@ -49,6 +49,7 @@ demonator
 | [Auto-advance](auto-advance.md) | Hands-free mode for recording with asciinema |
 | [Wait-for-pattern](wait-for-pattern.md) | Pause until regex matches in output |
 | [Setup & teardown](setup-teardown.md) | Hidden environment prep and cleanup |
+| [Environment variables](environment.md) | Global and per-step `env:` for commands |
 | [Interactive commands](interactive.md) | Expect-style responses to prompts |
 | [User prompts](user-prompts.md) | Collect yes/no or free-text input from the presenter |
 | [Conditional steps](conditionals.md) | Branch based on captured variables |

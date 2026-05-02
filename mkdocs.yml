@@ -51,6 +51,7 @@ nav:
       - Auto-Advance & Recording: auto-advance.md
       - Wait-for-Pattern: wait-for-pattern.md
       - Setup & Teardown: setup-teardown.md
+      - Environment Variables: environment.md
       - Interactive Commands: interactive.md
       - Conditional Steps: conditionals.md
   - Authoring Workflow: authoring.md

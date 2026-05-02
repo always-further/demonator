@@ -39,6 +39,8 @@ struct Config {
     #[serde(default)]
     teardown: Option<Vec<String>>,
     #[serde(default)]
+    env: HashMap<String, String>,
+    #[serde(default)]
     steps: Vec<Step>,
     #[serde(default)]
     chapters: Vec<Chapter>,
@@ -112,6 +114,10 @@ struct CommandStep {
     if_condition: Option<String>,
     #[serde(default)]
     unless: Option<String>,
+    #[serde(default)]
+    wait_before: bool,
+    #[serde(default)]
+    env: HashMap<String, String>,
 }
 
 #[derive(Deserialize)]
@@ -469,6 +475,49 @@ fn wait_for_enter() {
     }
 }
 
+// Wait for Enter without echoing the keystroke (keeps the cursor on the
+// current line so the next command can be typed in place of the prompt).
+fn wait_for_enter_silent() {
+    let saved = fs::File::open("/dev/tty")
+        .ok()
+        .and_then(|f| {
+            Command::new("stty")
+                .arg("-g")
+                .stdin(Stdio::from(f))
+                .output()
+                .ok()
+        })
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.trim().to_string());
+
+    if saved.is_some() {
+        if let Ok(f) = fs::File::open("/dev/tty") {
+            let _ = Command::new("stty")
+                .args(["-echo", "-icanon"])
+                .stdin(Stdio::from(f))
+                .status();
+        }
+    }
+
+    let tty = fs::File::open("/dev/tty").expect("failed to open /dev/tty");
+    let mut reader = io::BufReader::new(tty);
+    let mut buf = [0u8; 1];
+    loop {
+        if reader.read(&mut buf).unwrap_or(0) > 0 && (buf[0] == b'\n' || buf[0] == b'\r') {
+            break;
+        }
+    }
+
+    if let Some(saved) = saved {
+        if let Ok(f) = fs::File::open("/dev/tty") {
+            let _ = Command::new("stty")
+                .arg(&saved)
+                .stdin(Stdio::from(f))
+                .status();
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Variable substitution
 // ---------------------------------------------------------------------------
@@ -552,13 +601,18 @@ fn parse_json_path_segments(path: &str) -> Vec<JsonSegment> {
 // Command execution
 // ---------------------------------------------------------------------------
 
-fn run_command(cmd: &str, capture: Option<&Capture>) -> (Option<String>, i32) {
+fn run_command(
+    cmd: &str,
+    capture: Option<&Capture>,
+    env: &HashMap<String, String>,
+) -> (Option<String>, i32) {
     let needs_capture = capture.is_some();
 
     if needs_capture {
         let output = Command::new("sh")
             .arg("-c")
             .arg(cmd)
+            .envs(env)
             .stdin(Stdio::inherit())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -610,6 +664,7 @@ fn run_command(cmd: &str, capture: Option<&Capture>) -> (Option<String>, i32) {
         let status = Command::new("sh")
             .arg("-c")
             .arg(cmd)
+            .envs(env)
             .stdin(Stdio::inherit())
             .stdout(Stdio::inherit())
             .stderr(Stdio::inherit())
@@ -631,7 +686,12 @@ fn run_command(cmd: &str, capture: Option<&Capture>) -> (Option<String>, i32) {
     }
 }
 
-fn run_command_wait_for(cmd: &str, pattern: &str, timeout_secs: u64) -> i32 {
+fn run_command_wait_for(
+    cmd: &str,
+    pattern: &str,
+    timeout_secs: u64,
+    env: &HashMap<String, String>,
+) -> i32 {
     let re = match Regex::new(pattern) {
         Ok(r) => r,
         Err(e) => {
@@ -643,6 +703,7 @@ fn run_command_wait_for(cmd: &str, pattern: &str, timeout_secs: u64) -> i32 {
     let mut child = match Command::new("sh")
         .arg("-c")
         .arg(cmd)
+        .envs(env)
         .stdin(Stdio::inherit())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -746,10 +807,15 @@ fn run_command_wait_for(cmd: &str, pattern: &str, timeout_secs: u64) -> i32 {
     }
 }
 
-fn run_command_interact(cmd: &str, interactions: &[Interaction]) -> i32 {
+fn run_command_interact(
+    cmd: &str,
+    interactions: &[Interaction],
+    env: &HashMap<String, String>,
+) -> i32 {
     let mut child = match Command::new("sh")
         .arg("-c")
         .arg(cmd)
+        .envs(env)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
@@ -877,11 +943,12 @@ fn print_chapter_header(name: &str) {
     println!();
 }
 
-fn run_hidden_commands(commands: &[String]) {
+fn run_hidden_commands(commands: &[String], env: &HashMap<String, String>) {
     for cmd in commands {
         let status = Command::new("sh")
             .arg("-c")
             .arg(cmd)
+            .envs(env)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -941,6 +1008,8 @@ struct CommandRef {
     interact: Option<Vec<InteractionRef>>,
     if_condition: Option<String>,
     unless: Option<String>,
+    wait_before: bool,
+    env: HashMap<String, String>,
 }
 
 struct CaptureRef {
@@ -996,6 +1065,8 @@ fn resolve_step(step: &Step) -> ResolvedStep {
                 }),
                 if_condition: cmd.if_condition.clone(),
                 unless: cmd.unless.clone(),
+                wait_before: cmd.wait_before,
+                env: cmd.env.clone(),
             }),
         },
     }
@@ -1159,7 +1230,7 @@ fn load_config(path: &Path) -> Config {
 fn run_demo(config: &Config, cli: &Cli) {
     // Setup
     if let Some(ref setup) = config.setup {
-        run_hidden_commands(setup);
+        run_hidden_commands(setup, &config.env);
     }
 
     // Dry run
@@ -1290,6 +1361,10 @@ fn run_demo(config: &Config, cli: &Cli) {
                 print!("{}", prompt);
                 io::stdout().flush().unwrap();
 
+                if cmd.wait_before {
+                    wait_for_enter_silent();
+                }
+
                 let base_delay = if let Some(speed) = cmd.speed.or(config.speed) {
                     speed_to_delay(speed)
                 } else {
@@ -1361,6 +1436,12 @@ fn run_demo(config: &Config, cli: &Cli) {
                 };
                 let _ = nav;
 
+                // Merge global + per-step env (per-step wins)
+                let mut step_env: HashMap<String, String> = config.env.clone();
+                for (k, v) in &cmd.env {
+                    step_env.insert(k.clone(), v.clone());
+                }
+
                 // Execute the command
                 if let Some(ref fake) = cmd.fake_output {
                     // Fake output mode
@@ -1378,6 +1459,7 @@ fn run_demo(config: &Config, cli: &Cli) {
                         let _ = Command::new("sh")
                             .arg("-c")
                             .arg(&resolved_text)
+                            .envs(&step_env)
                             .stdin(Stdio::null())
                             .stdout(Stdio::null())
                             .stderr(Stdio::null())
@@ -1386,7 +1468,7 @@ fn run_demo(config: &Config, cli: &Cli) {
                 } else if !cmd.execute {
                     // No execution, no fake output — just typed the command
                 } else if let Some(ref pattern) = cmd.wait_for {
-                    run_command_wait_for(&resolved_text, pattern, cmd.timeout);
+                    run_command_wait_for(&resolved_text, pattern, cmd.timeout, &step_env);
                 } else if let Some(ref interactions) = cmd.interact {
                     let interaction_refs: Vec<Interaction> = interactions
                         .iter()
@@ -1395,7 +1477,7 @@ fn run_demo(config: &Config, cli: &Cli) {
                             send: i.send.clone(),
                         })
                         .collect();
-                    run_command_interact(&resolved_text, &interaction_refs);
+                    run_command_interact(&resolved_text, &interaction_refs, &step_env);
                 } else {
                     let capture_ref = cmd.capture.as_ref().map(|c| Capture {
                         name: c.name.clone(),
@@ -1403,7 +1485,7 @@ fn run_demo(config: &Config, cli: &Cli) {
                         json_path: c.json_path.clone(),
                     });
                     let (captured, _code) =
-                        run_command(&resolved_text, capture_ref.as_ref());
+                        run_command(&resolved_text, capture_ref.as_ref(), &step_env);
                     if let Some(value) = captured {
                         if let Some(ref cap) = cmd.capture {
                             vars.insert(cap.name.clone(), value);
@@ -1418,7 +1500,7 @@ fn run_demo(config: &Config, cli: &Cli) {
 
     // Teardown
     if let Some(ref teardown) = config.teardown {
-        run_hidden_commands(teardown);
+        run_hidden_commands(teardown, &config.env);
     }
 }
 
@@ -2050,6 +2132,8 @@ steps:
             interact: None,
             if_condition: Some("myvar".to_string()),
             unless: None,
+            wait_before: false,
+            env: HashMap::new(),
         };
 
         let mut vars = HashMap::new();
@@ -2080,6 +2164,8 @@ steps:
             interact: None,
             if_condition: None,
             unless: Some("myvar".to_string()),
+            wait_before: false,
+            env: HashMap::new(),
         };
 
         let vars = HashMap::new();

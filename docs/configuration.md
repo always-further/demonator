@@ -16,6 +16,7 @@ Demonator is configured with a YAML file (default: `demo.yml`).
 | `auto_advance` | integer  | --                                   | Auto-advance delay in ms (skips Enter prompt)     |
 | `setup`        | string[] | --                                   | Commands to run silently before the demo          |
 | `teardown`     | string[] | --                                   | Commands to run silently after the demo           |
+| `env`          | map      | `{}`                                 | Environment variables exported into every command |
 
 ## Steps
 
@@ -72,6 +73,40 @@ These fields are available on command steps (`text:` steps):
 | `interact`     | object[] | --      | Expect-style interaction pairs                      |
 | `if`           | string   | --      | Only run if this captured variable is set           |
 | `unless`       | string   | --      | Only run if this captured variable is NOT set       |
+| `wait_before`  | bool     | `false` | Show the prompt and wait for Enter before typing    |
+| `env`          | map      | `{}`    | Per-step env vars (merged over global, step wins)   |
+
+## Environment variables
+
+Set env vars at the global level to apply to every command, every `setup`/
+`teardown` hook, and every `wait_for`/`interact` invocation:
+
+```yaml
+env:
+  AWS_PROFILE: demo
+  LOG_LEVEL: debug
+
+steps:
+  - text: "aws s3 ls"          # sees AWS_PROFILE=demo
+```
+
+Override or extend for a single step with a per-step `env:`. Per-step keys
+win over global keys; other global keys are inherited:
+
+```yaml
+env:
+  LOG_LEVEL: debug
+
+steps:
+  - text: "./run --verbose"    # LOG_LEVEL=debug
+  - text: "./run --quiet"
+    env:
+      LOG_LEVEL: error         # this step only
+```
+
+Values are passed verbatim to the spawned shell — they are not interpolated
+by demonator. To pull a value from the host environment, reference it from
+the command itself: `text: "echo $TOKEN"`.
 
 ## Capture block
 
