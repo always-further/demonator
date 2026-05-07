@@ -3,6 +3,10 @@ name = "demonator"
 version = "0.1.0"
 edition = "2021"
 description = "Typewriter-style text display for terminal demos"
+license = "Apache-2.0"
+repository = "https://github.com/always-further/demonator"
+homepage = "https://github.com/always-further/demonator"
+documentation = "https://docs.rs/demonator"
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }
