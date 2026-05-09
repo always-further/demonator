@@ -120,6 +120,8 @@ struct CommandStep {
     wait_after: bool,
     #[serde(default)]
     env: HashMap<String, String>,
+    #[serde(default)]
+    hidden: bool,
 }
 
 #[derive(Deserialize)]
@@ -473,6 +475,46 @@ fn wait_for_enter() {
     loop {
         if reader.read(&mut buf).unwrap_or(0) > 0 && buf[0] == b'\n' {
             break;
+        }
+    }
+}
+
+// Wait for any keypress without echoing (no cursor movement, safe for erasing
+// the line afterwards). Used by wait_after so Enter's newline doesn't interfere.
+fn wait_for_any_key_silent() {
+    let saved = fs::File::open("/dev/tty")
+        .ok()
+        .and_then(|f| {
+            Command::new("stty")
+                .arg("-g")
+                .stdin(Stdio::from(f))
+                .output()
+                .ok()
+        })
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.trim().to_string());
+
+    if saved.is_some() {
+        if let Ok(f) = fs::File::open("/dev/tty") {
+            let _ = Command::new("stty")
+                .args(["-echo", "-icanon"])
+                .stdin(Stdio::from(f))
+                .status();
+        }
+    }
+
+    let tty = fs::File::open("/dev/tty").expect("failed to open /dev/tty");
+    let mut reader = io::BufReader::new(tty);
+    let mut buf = [0u8; 1];
+    // Accept any keypress — not just Enter — so no newline is generated.
+    while reader.read(&mut buf).unwrap_or(0) == 0 {}
+
+    if let Some(saved) = saved {
+        if let Ok(f) = fs::File::open("/dev/tty") {
+            let _ = Command::new("stty")
+                .arg(&saved)
+                .stdin(Stdio::from(f))
+                .status();
         }
     }
 }
@@ -1013,6 +1055,7 @@ struct CommandRef {
     wait_before: bool,
     wait_after: bool,
     env: HashMap<String, String>,
+    hidden: bool,
 }
 
 struct CaptureRef {
@@ -1071,6 +1114,7 @@ fn resolve_step(step: &Step) -> ResolvedStep {
                 wait_before: cmd.wait_before,
                 wait_after: cmd.wait_after,
                 env: cmd.env.clone(),
+                hidden: cmd.hidden,
             }),
         },
     }
@@ -1173,6 +1217,9 @@ fn print_dry_run(config: &Config) {
                 }
                 if cmd.capture.is_some() {
                     annotations.push("capture");
+                }
+                if cmd.hidden {
+                    annotations.push("hidden");
                 }
                 if !annotations.is_empty() {
                     print!("  \x1B[2m[{}]\x1B[0m", annotations.join(", "));
@@ -1364,6 +1411,28 @@ fn run_demo(config: &Config, cli: &Cli) {
 
                 let resolved_text = substitute_vars(&cmd.text, &vars);
 
+                if cmd.hidden {
+                    // Run silently — no prompt, no typing, no wait
+                    let mut step_env: HashMap<String, String> = config.env.clone();
+                    for (k, v) in &cmd.env {
+                        step_env.insert(k.clone(), v.clone());
+                    }
+                    let capture_ref = cmd.capture.as_ref().map(|c| Capture {
+                        name: c.name.clone(),
+                        pattern: c.pattern.clone(),
+                        json_path: c.json_path.clone(),
+                    });
+                    let (captured, _code) =
+                        run_command(&resolved_text, capture_ref.as_ref(), &step_env);
+                    if let Some(value) = captured {
+                        if let Some(ref cap) = cmd.capture {
+                            vars.insert(cap.name.clone(), value);
+                        }
+                    }
+                    idx += 1;
+                    continue;
+                }
+
                 // Type the command
                 print!("{}", prompt);
                 io::stdout().flush().unwrap();
@@ -1501,7 +1570,11 @@ fn run_demo(config: &Config, cli: &Cli) {
                 }
 
                 if cmd.wait_after {
-                    wait_for_enter_silent();
+                    print!("{}", prompt);
+                    io::stdout().flush().unwrap();
+                    wait_for_any_key_silent();
+                    print!("\r\x1B[2K");
+                    io::stdout().flush().unwrap();
                 }
             }
         }
@@ -2146,6 +2219,7 @@ steps:
             wait_before: false,
             wait_after: false,
             env: HashMap::new(),
+            hidden: false,
         };
 
         let mut vars = HashMap::new();
@@ -2179,6 +2253,7 @@ steps:
             wait_before: false,
             wait_after: false,
             env: HashMap::new(),
+            hidden: false,
         };
 
         let vars = HashMap::new();
@@ -2273,6 +2348,26 @@ steps:
         match &config.steps[0] {
             Step::Command(cmd) => {
                 assert_eq!(cmd.output_speed, Some(40));
+            }
+            _ => panic!("expected Command step"),
+        }
+    }
+
+    #[test]
+    fn test_hidden_step() {
+        let yaml = r#"
+steps:
+  - text: "nono audit list --recent 1 --json"
+    hidden: true
+    capture:
+      name: session_id
+      json_path: "[0].session_id"
+"#;
+        let config: Config = serde_yaml::from_str(yaml).unwrap();
+        match &config.steps[0] {
+            Step::Command(cmd) => {
+                assert!(cmd.hidden);
+                assert_eq!(cmd.capture.as_ref().unwrap().name, "session_id");
             }
             _ => panic!("expected Command step"),
         }

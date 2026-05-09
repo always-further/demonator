@@ -1,0 +1,8 @@
+delay: 50
+
+steps:
+  - text: "nono audit list --recent 1 --json"
+    capture:
+      name: session_id
+      json_path: "[0].session_id"
+  - text: "nono audit show {session_id} --json"

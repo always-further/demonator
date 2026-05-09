@@ -76,6 +76,7 @@ These fields are available on command steps (`text:` steps):
 | `wait_before`  | bool     | `false` | Pause for Enter before typing starts (see [Pacing](pacing.md)) |
 | `wait_after`   | bool     | `false` | Pause for Enter after output is shown (see [Pacing](pacing.md)) |
 | `env`          | map      | `{}`    | Per-step env vars (merged over global, step wins)   |
+| `hidden`       | bool     | `false` | Run silently — no prompt, no typing, no keypress wait (see [Hidden steps](hidden-steps.md)) |
 
 ## Environment variables
 
@@ -111,14 +112,32 @@ the command itself: `text: "echo $TOKEN"`.
 
 ## Capture block
 
+Extract output from a command into a variable for use in later steps.
+
 ```yaml
 capture:
-  name: my_var           # variable name for later substitution
-  pattern: "regex (\\w+)" # regex with one capture group
+  name: my_var            # variable name for later substitution
+  pattern: "regex (\\w+)" # regex — first capture group is stored
 ```
 
-The first capture group is extracted from combined stdout+stderr and stored.
-Reference it in later steps with `{my_var}`.
+Use `json_path` instead of `pattern` to extract a value from JSON output:
+
+```yaml
+capture:
+  name: session_id
+  json_path: "[0].session_id"  # array index then key
+```
+
+Supported path forms:
+
+| Form | Example | Matches |
+|------|---------|---------|
+| Simple key | `name` | `{"name": "alice"}` |
+| Nested keys | `data.id` | `{"data": {"id": 42}}` |
+| Array index + key | `[0].session_id` | `[{"session_id": "abc"}]` |
+| Nested array | `items[1].name` | `{"items": [{}, {"name": "b"}]}` |
+
+The captured value is stored and referenced in later steps with `{my_var}`.
 
 ## Interact block
 

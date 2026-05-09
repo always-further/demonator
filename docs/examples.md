@@ -182,6 +182,31 @@ steps:
   - text: "nono attach {session_id}"
 ```
 
+## Hidden step with JSON capture
+
+Fetch state silently then use it in visible steps:
+
+```yaml
+speed: 20
+clear: true
+
+steps:
+  - comment: "Inspecting the most recent audit session."
+    style: cyan
+
+  - text: "nono audit list --recent 1 --json"
+    hidden: true
+    capture:
+      name: session_id
+      json_path: "[0].session_id"
+
+  - text: "nono audit show {session_id}"
+```
+
+The list command runs invisibly, captures the session ID from the JSON response,
+and the audience only sees the `nono audit show` command with the real ID already
+substituted in.
+
 ## Interactive command
 
 Automate responses to an interactive prompt:

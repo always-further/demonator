@@ -30,9 +30,8 @@ Flow:
 
 ## `wait_after`
 
-Pause for Enter *after* the command finishes and its output is shown, before
-the next prompt appears. Useful when you want time to explain the output before
-moving on.
+Pause *after* the command finishes and its output is shown, before the next
+prompt appears. Useful when you want time to explain the output before moving on.
 
 ```yaml
 steps:
@@ -47,11 +46,16 @@ Flow:
 ```
 ~ $ kubectl get pods
 <output>
-[you press Enter]           ← wait_after pause
+~ $                         ← prompt shown; press any key (Space works well)
 ~ $ kubectl describe pod my-pod
 [you press Enter]           ← normal execution pause
 <output>
 ```
+
+!!! note "Press any key, not Enter"
+    `wait_after` accepts **any keypress** to advance. Pressing Enter would
+    inject a newline before the next prompt; Space or any other key avoids
+    this and keeps the output clean.
 
 ## Combining both
 

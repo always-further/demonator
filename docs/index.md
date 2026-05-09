@@ -53,6 +53,7 @@ demonator
 | [Interactive commands](interactive.md) | Expect-style responses to prompts |
 | [User prompts](user-prompts.md) | Collect yes/no or free-text input from the presenter |
 | [Conditional steps](conditionals.md) | Branch based on captured variables |
+| [Hidden steps](hidden-steps.md) | Run commands silently to capture state without showing them |
 | [Pacing & manual control](pacing.md) | Pause before or after a step with `wait_before` / `wait_after` |
 | [Authoring tools](authoring.md) | Dry-run preview and hot reload |
 
