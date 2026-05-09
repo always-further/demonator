@@ -24,6 +24,8 @@ Dry-run output shows:
   - `[interactive]` — step has expect/send interactions
   - `[conditional]` — step has `if` or `unless` conditions
   - `[capture]` — step captures output
+  - `[wait-before]` — step pauses for Enter before typing starts
+  - `[wait-after]` — step pauses for Enter after output is shown
 
 Example dry-run output:
 

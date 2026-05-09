@@ -117,6 +117,8 @@ struct CommandStep {
     #[serde(default)]
     wait_before: bool,
     #[serde(default)]
+    wait_after: bool,
+    #[serde(default)]
     env: HashMap<String, String>,
 }
 
@@ -1009,6 +1011,7 @@ struct CommandRef {
     if_condition: Option<String>,
     unless: Option<String>,
     wait_before: bool,
+    wait_after: bool,
     env: HashMap<String, String>,
 }
 
@@ -1066,6 +1069,7 @@ fn resolve_step(step: &Step) -> ResolvedStep {
                 if_condition: cmd.if_condition.clone(),
                 unless: cmd.unless.clone(),
                 wait_before: cmd.wait_before,
+                wait_after: cmd.wait_after,
                 env: cmd.env.clone(),
             }),
         },
@@ -1160,6 +1164,9 @@ fn print_dry_run(config: &Config) {
                 }
                 if cmd.interact.is_some() {
                     annotations.push("interactive");
+                }
+                if cmd.wait_after {
+                    annotations.push("wait-after");
                 }
                 if cmd.if_condition.is_some() || cmd.unless.is_some() {
                     annotations.push("conditional");
@@ -1491,6 +1498,10 @@ fn run_demo(config: &Config, cli: &Cli) {
                             vars.insert(cap.name.clone(), value);
                         }
                     }
+                }
+
+                if cmd.wait_after {
+                    wait_for_enter_silent();
                 }
             }
         }
@@ -2133,6 +2144,7 @@ steps:
             if_condition: Some("myvar".to_string()),
             unless: None,
             wait_before: false,
+            wait_after: false,
             env: HashMap::new(),
         };
 
@@ -2165,6 +2177,7 @@ steps:
             if_condition: None,
             unless: Some("myvar".to_string()),
             wait_before: false,
+            wait_after: false,
             env: HashMap::new(),
         };
 

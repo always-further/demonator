@@ -54,6 +54,7 @@ nav:
       - Environment Variables: environment.md
       - Interactive Commands: interactive.md
       - Conditional Steps: conditionals.md
+      - Pacing & Manual Control: pacing.md
   - Authoring Workflow: authoring.md
   - Examples: examples.md
 

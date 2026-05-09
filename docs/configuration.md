@@ -73,7 +73,8 @@ These fields are available on command steps (`text:` steps):
 | `interact`     | object[] | --      | Expect-style interaction pairs                      |
 | `if`           | string   | --      | Only run if this captured variable is set           |
 | `unless`       | string   | --      | Only run if this captured variable is NOT set       |
-| `wait_before`  | bool     | `false` | Show the prompt and wait for Enter before typing    |
+| `wait_before`  | bool     | `false` | Pause for Enter before typing starts (see [Pacing](pacing.md)) |
+| `wait_after`   | bool     | `false` | Pause for Enter after output is shown (see [Pacing](pacing.md)) |
 | `env`          | map      | `{}`    | Per-step env vars (merged over global, step wins)   |
 
 ## Environment variables
