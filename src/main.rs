@@ -1412,22 +1412,46 @@ fn run_demo(config: &Config, cli: &Cli) {
                 let resolved_text = substitute_vars(&cmd.text, &vars);
 
                 if cmd.hidden {
-                    // Run silently — no prompt, no typing, no wait
+                    // Run silently — no prompt, no typing, no output, no wait
                     let mut step_env: HashMap<String, String> = config.env.clone();
                     for (k, v) in &cmd.env {
                         step_env.insert(k.clone(), v.clone());
                     }
-                    let capture_ref = cmd.capture.as_ref().map(|c| Capture {
-                        name: c.name.clone(),
-                        pattern: c.pattern.clone(),
-                        json_path: c.json_path.clone(),
-                    });
-                    let (captured, _code) =
-                        run_command(&resolved_text, capture_ref.as_ref(), &step_env);
-                    if let Some(value) = captured {
-                        if let Some(ref cap) = cmd.capture {
-                            vars.insert(cap.name.clone(), value);
+                    if let Some(ref cap) = cmd.capture {
+                        if let Ok(output) = Command::new("sh")
+                            .arg("-c")
+                            .arg(&resolved_text)
+                            .envs(&step_env)
+                            .stdin(Stdio::null())
+                            .stdout(Stdio::piped())
+                            .stderr(Stdio::null())
+                            .output()
+                        {
+                            let stdout_str = String::from_utf8_lossy(&output.stdout);
+                            let value = if let Some(ref jp) = cap.json_path {
+                                extract_json_path(&stdout_str, jp)
+                            } else if let Some(ref pattern) = cap.pattern {
+                                Regex::new(pattern).ok().and_then(|re| {
+                                    re.captures(stdout_str.as_ref())
+                                        .and_then(|caps| caps.get(1))
+                                        .map(|m| m.as_str().to_string())
+                                })
+                            } else {
+                                None
+                            };
+                            if let Some(v) = value {
+                                vars.insert(cap.name.clone(), v);
+                            }
                         }
+                    } else {
+                        let _ = Command::new("sh")
+                            .arg("-c")
+                            .arg(&resolved_text)
+                            .envs(&step_env)
+                            .stdin(Stdio::null())
+                            .stdout(Stdio::null())
+                            .stderr(Stdio::null())
+                            .status();
                     }
                     idx += 1;
                     continue;
