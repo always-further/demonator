@@ -7,10 +7,13 @@ use std::collections::HashMap;
 use std::fs;
 use std::io::{self, BufRead, Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{self, Command, Stdio};
+use std::process::{self, Command, ExitStatus, Output, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, SystemTime};
+
+static ENV_SNAPSHOT_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 // ---------------------------------------------------------------------------
 // Configuration structures
@@ -152,7 +155,10 @@ fn default_timeout() -> u64 {
 // ---------------------------------------------------------------------------
 
 #[derive(Parser)]
-#[command(name = "demonator", about = "Typewriter-style text display for terminal demos")]
+#[command(
+    name = "demonator",
+    about = "Typewriter-style text display for terminal demos"
+)]
 struct Cli {
     /// Path to config file
     #[arg(short, long, default_value = "demo.yml")]
@@ -181,7 +187,7 @@ fn default_jitter() -> u64 {
     0
 }
 fn default_pause() -> u64 {
-    200
+    0
 }
 
 // ---------------------------------------------------------------------------
@@ -363,6 +369,33 @@ fn speed_to_delay(speed: u64) -> u64 {
     ((1000.0 / speed as f64).round() as u64).max(1)
 }
 
+fn resolve_delay(cmd: &CommandStep, config: &Config) -> u64 {
+    if let Some(speed) = cmd.speed.or(config.speed) {
+        speed_to_delay(speed)
+    } else {
+        cmd.delay.unwrap_or(config.delay)
+    }
+}
+
+fn should_run_step(cmd: &CommandStep, vars: &HashMap<String, String>) -> bool {
+    if let Some(ref var_name) = cmd.if_condition {
+        match vars.get(var_name) {
+            Some(v) if !v.trim().is_empty() => {}
+            _ => return false,
+        }
+    }
+
+    if let Some(ref var_name) = cmd.unless {
+        if let Some(v) = vars.get(var_name) {
+            if !v.trim().is_empty() {
+                return false;
+            }
+        }
+    }
+
+    true
+}
+
 // ---------------------------------------------------------------------------
 // Text output
 // ---------------------------------------------------------------------------
@@ -440,18 +473,74 @@ enum NavAction {
     JumpChapter(usize),
 }
 
+fn set_tty_mode(args: &[&str]) {
+    if let Ok(f) = fs::File::open("/dev/tty") {
+        let _ = Command::new("stty")
+            .args(args)
+            .stdin(Stdio::from(f))
+            .status();
+    }
+}
+
+fn restore_tty_mode(saved: Option<String>) {
+    if let Some(saved) = saved {
+        set_tty_mode(&[&saved]);
+    }
+}
+
+fn drain_pending_enter_bytes(reader: &mut io::BufReader<fs::File>) {
+    set_tty_mode(&["min", "0", "time", "1"]);
+
+    let mut buf = [0u8; 1];
+    loop {
+        match reader.read(&mut buf) {
+            Ok(0) | Err(_) => break,
+            Ok(_) if buf[0] == b'\n' || buf[0] == b'\r' => {}
+            Ok(_) => break,
+        }
+    }
+}
+
 fn wait_for_input(has_chapters: bool) -> NavAction {
+    let saved = fs::File::open("/dev/tty")
+        .ok()
+        .and_then(|f| {
+            Command::new("stty")
+                .arg("-g")
+                .stdin(Stdio::from(f))
+                .output()
+                .ok()
+        })
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.trim().to_string());
+
+    if saved.is_some() {
+        set_tty_mode(&["-echo", "-icanon", "min", "1", "time", "0"]);
+    }
+
     let tty = fs::File::open("/dev/tty").expect("failed to open /dev/tty");
     let mut reader = io::BufReader::new(tty);
-    let mut line = String::new();
-    reader.read_line(&mut line).unwrap_or(0);
-    let trimmed = line.trim();
+    let mut buf = [0u8; 1];
+    let mut input: Vec<u8> = Vec::new();
 
-    if !has_chapters || trimmed.is_empty() {
+    loop {
+        if reader.read(&mut buf).unwrap_or(0) > 0 {
+            if buf[0] == b'\n' || buf[0] == b'\r' {
+                drain_pending_enter_bytes(&mut reader);
+                break;
+            }
+            input.push(buf[0]);
+        }
+    }
+
+    restore_tty_mode(saved);
+
+    if !has_chapters || input.is_empty() {
         return NavAction::Continue;
     }
 
-    match trimmed {
+    let trimmed = String::from_utf8_lossy(&input);
+    match trimmed.as_ref() {
         "n" => NavAction::NextChapter,
         "p" => NavAction::PrevChapter,
         s => {
@@ -495,12 +584,7 @@ fn wait_for_any_key_silent() {
         .map(|s| s.trim().to_string());
 
     if saved.is_some() {
-        if let Ok(f) = fs::File::open("/dev/tty") {
-            let _ = Command::new("stty")
-                .args(["-echo", "-icanon"])
-                .stdin(Stdio::from(f))
-                .status();
-        }
+        set_tty_mode(&["-echo", "-icanon", "min", "1", "time", "0"]);
     }
 
     let tty = fs::File::open("/dev/tty").expect("failed to open /dev/tty");
@@ -508,15 +592,11 @@ fn wait_for_any_key_silent() {
     let mut buf = [0u8; 1];
     // Accept any keypress — not just Enter — so no newline is generated.
     while reader.read(&mut buf).unwrap_or(0) == 0 {}
-
-    if let Some(saved) = saved {
-        if let Ok(f) = fs::File::open("/dev/tty") {
-            let _ = Command::new("stty")
-                .arg(&saved)
-                .stdin(Stdio::from(f))
-                .status();
-        }
+    if buf[0] == b'\n' || buf[0] == b'\r' {
+        drain_pending_enter_bytes(&mut reader);
     }
+
+    restore_tty_mode(saved);
 }
 
 // Wait for Enter without echoing the keystroke (keeps the cursor on the
@@ -535,12 +615,7 @@ fn wait_for_enter_silent() {
         .map(|s| s.trim().to_string());
 
     if saved.is_some() {
-        if let Ok(f) = fs::File::open("/dev/tty") {
-            let _ = Command::new("stty")
-                .args(["-echo", "-icanon"])
-                .stdin(Stdio::from(f))
-                .status();
-        }
+        set_tty_mode(&["-echo", "-icanon", "min", "1", "time", "0"]);
     }
 
     let tty = fs::File::open("/dev/tty").expect("failed to open /dev/tty");
@@ -548,18 +623,12 @@ fn wait_for_enter_silent() {
     let mut buf = [0u8; 1];
     loop {
         if reader.read(&mut buf).unwrap_or(0) > 0 && (buf[0] == b'\n' || buf[0] == b'\r') {
+            drain_pending_enter_bytes(&mut reader);
             break;
         }
     }
 
-    if let Some(saved) = saved {
-        if let Ok(f) = fs::File::open("/dev/tty") {
-            let _ = Command::new("stty")
-                .arg(&saved)
-                .stdin(Stdio::from(f))
-                .status();
-        }
-    }
+    restore_tty_mode(saved);
 }
 
 // ---------------------------------------------------------------------------
@@ -645,25 +714,146 @@ fn parse_json_path_segments(path: &str) -> Vec<JsonSegment> {
 // Command execution
 // ---------------------------------------------------------------------------
 
+fn initial_env(config_env: &HashMap<String, String>) -> HashMap<String, String> {
+    let mut env: HashMap<String, String> = std::env::vars().collect();
+    for (k, v) in config_env {
+        env.insert(k.clone(), v.clone());
+    }
+    env
+}
+
+fn merge_env(
+    base: &HashMap<String, String>,
+    overlay: &HashMap<String, String>,
+) -> HashMap<String, String> {
+    let mut env = base.clone();
+    for (k, v) in overlay {
+        env.insert(k.clone(), v.clone());
+    }
+    env
+}
+
+fn env_snapshot_path() -> PathBuf {
+    let n = ENV_SNAPSHOT_COUNTER.fetch_add(1, Ordering::Relaxed);
+    std::env::temp_dir().join(format!("demonator-env-{}-{}.env", process::id(), n))
+}
+
+fn shell_script_with_env_snapshot(cmd: &str) -> String {
+    format!(
+        "{}\n__demonator_status=$?\nenv -0 > \"$DEMONATOR_ENV_FILE\"\nexit \"$__demonator_status\"",
+        cmd
+    )
+}
+
+fn read_env_snapshot(path: &Path) -> Option<HashMap<String, String>> {
+    let bytes = fs::read(path).ok()?;
+    let _ = fs::remove_file(path);
+    let mut env = HashMap::new();
+
+    for entry in bytes.split(|b| *b == 0) {
+        if entry.is_empty() {
+            continue;
+        }
+        let Some(eq) = entry.iter().position(|b| *b == b'=') else {
+            continue;
+        };
+        let key = String::from_utf8_lossy(&entry[..eq]).to_string();
+        let value = String::from_utf8_lossy(&entry[eq + 1..]).to_string();
+        env.insert(key, value);
+    }
+
+    Some(env)
+}
+
+fn persist_env_snapshot(
+    env_state: &mut HashMap<String, String>,
+    before: &HashMap<String, String>,
+    overlay: &HashMap<String, String>,
+    snapshot: Option<HashMap<String, String>>,
+) {
+    let Some(mut next) = snapshot else {
+        return;
+    };
+
+    // Per-step `env:` values are temporary unless the command changes or unsets
+    // them. Restore unchanged overlay keys so step-local overrides stay local.
+    for (key, overlay_value) in overlay {
+        if next.get(key) == Some(overlay_value) {
+            if let Some(previous) = before.get(key) {
+                next.insert(key.clone(), previous.clone());
+            } else {
+                next.remove(key);
+            }
+        }
+    }
+
+    *env_state = next;
+}
+
+fn shell_status_with_env_snapshot(
+    cmd: &str,
+    env: &HashMap<String, String>,
+    stdin: Stdio,
+    stdout: Stdio,
+    stderr: Stdio,
+) -> io::Result<(ExitStatus, Option<HashMap<String, String>>)> {
+    let path = env_snapshot_path();
+    let status = Command::new("sh")
+        .arg("-c")
+        .arg(shell_script_with_env_snapshot(cmd))
+        .envs(env)
+        .env("DEMONATOR_ENV_FILE", &path)
+        .stdin(stdin)
+        .stdout(stdout)
+        .stderr(stderr)
+        .status();
+    let snapshot = read_env_snapshot(&path);
+    status.map(|s| (s, snapshot))
+}
+
+fn shell_output_with_env_snapshot(
+    cmd: &str,
+    env: &HashMap<String, String>,
+    stdin: Stdio,
+    stdout: Stdio,
+    stderr: Stdio,
+) -> io::Result<(Output, Option<HashMap<String, String>>)> {
+    let path = env_snapshot_path();
+    let output = Command::new("sh")
+        .arg("-c")
+        .arg(shell_script_with_env_snapshot(cmd))
+        .envs(env)
+        .env("DEMONATOR_ENV_FILE", &path)
+        .stdin(stdin)
+        .stdout(stdout)
+        .stderr(stderr)
+        .output();
+    let snapshot = read_env_snapshot(&path);
+    output.map(|o| (o, snapshot))
+}
+
 fn run_command(
     cmd: &str,
     capture: Option<&Capture>,
-    env: &HashMap<String, String>,
+    env_state: &mut HashMap<String, String>,
+    overlay: &HashMap<String, String>,
 ) -> (Option<String>, i32) {
     let needs_capture = capture.is_some();
+    let before = env_state.clone();
+    let env = merge_env(env_state, overlay);
 
     if needs_capture {
-        let output = Command::new("sh")
-            .arg("-c")
-            .arg(cmd)
-            .envs(env)
-            .stdin(Stdio::inherit())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .output();
+        let output = shell_output_with_env_snapshot(
+            cmd,
+            &env,
+            Stdio::inherit(),
+            Stdio::piped(),
+            Stdio::piped(),
+        );
 
         match output {
-            Ok(o) => {
+            Ok((o, snapshot)) => {
+                persist_env_snapshot(env_state, &before, overlay, snapshot);
                 let stdout_str = String::from_utf8_lossy(&o.stdout);
                 let stderr_str = String::from_utf8_lossy(&o.stderr);
                 print!("{}", stdout_str);
@@ -705,17 +895,17 @@ fn run_command(
             }
         }
     } else {
-        let status = Command::new("sh")
-            .arg("-c")
-            .arg(cmd)
-            .envs(env)
-            .stdin(Stdio::inherit())
-            .stdout(Stdio::inherit())
-            .stderr(Stdio::inherit())
-            .status();
+        let status = shell_status_with_env_snapshot(
+            cmd,
+            &env,
+            Stdio::inherit(),
+            Stdio::inherit(),
+            Stdio::inherit(),
+        );
 
         match status {
-            Ok(s) => {
+            Ok((s, snapshot)) => {
+                persist_env_snapshot(env_state, &before, overlay, snapshot);
                 let code = s.code().unwrap_or(1);
                 if !s.success() {
                     eprintln!("[demonator] command exited with status {}", code);
@@ -734,7 +924,8 @@ fn run_command_wait_for(
     cmd: &str,
     pattern: &str,
     timeout_secs: u64,
-    env: &HashMap<String, String>,
+    env_state: &mut HashMap<String, String>,
+    overlay: &HashMap<String, String>,
 ) -> i32 {
     let re = match Regex::new(pattern) {
         Ok(r) => r,
@@ -744,10 +935,14 @@ fn run_command_wait_for(
         }
     };
 
+    let before = env_state.clone();
+    let env = merge_env(env_state, overlay);
+    let path = env_snapshot_path();
     let mut child = match Command::new("sh")
         .arg("-c")
-        .arg(cmd)
-        .envs(env)
+        .arg(shell_script_with_env_snapshot(cmd))
+        .envs(&env)
+        .env("DEMONATOR_ENV_FILE", &path)
         .stdin(Stdio::inherit())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -799,10 +994,7 @@ fn run_command_wait_for(
             .duration_since(SystemTime::now())
             .unwrap_or(Duration::ZERO);
         if remaining.is_zero() {
-            eprintln!(
-                "[demonator] wait_for timed out after {}s",
-                timeout_secs
-            );
+            eprintln!("[demonator] wait_for timed out after {}s", timeout_secs);
             let _ = child.kill();
             let _ = child.wait();
             return 1;
@@ -833,14 +1025,17 @@ fn run_command_wait_for(
                     io::stdout().flush().unwrap();
 
                     if re.is_match(&accumulated) {
+                        persist_env_snapshot(env_state, &before, overlay, read_env_snapshot(&path));
                         return 0;
                     }
                     eprintln!("[demonator] command exited before pattern matched");
+                    persist_env_snapshot(env_state, &before, overlay, read_env_snapshot(&path));
                     return status.code().unwrap_or(1);
                 }
             }
             Err(mpsc::RecvTimeoutError::Disconnected) => {
                 let _ = child.wait();
+                persist_env_snapshot(env_state, &before, overlay, read_env_snapshot(&path));
                 if re.is_match(&accumulated) {
                     return 0;
                 }
@@ -854,12 +1049,17 @@ fn run_command_wait_for(
 fn run_command_interact(
     cmd: &str,
     interactions: &[Interaction],
-    env: &HashMap<String, String>,
+    env_state: &mut HashMap<String, String>,
+    overlay: &HashMap<String, String>,
 ) -> i32 {
+    let before = env_state.clone();
+    let env = merge_env(env_state, overlay);
+    let path = env_snapshot_path();
     let mut child = match Command::new("sh")
         .arg("-c")
-        .arg(cmd)
-        .envs(env)
+        .arg(shell_script_with_env_snapshot(cmd))
+        .envs(&env)
+        .env("DEMONATOR_ENV_FILE", &path)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
@@ -952,6 +1152,7 @@ fn run_command_interact(
     io::stdout().flush().unwrap();
 
     let status = child.wait().unwrap_or_else(|_| process::exit(1));
+    persist_env_snapshot(env_state, &before, overlay, read_env_snapshot(&path));
     status.code().unwrap_or(1)
 }
 
@@ -987,18 +1188,19 @@ fn print_chapter_header(name: &str) {
     println!();
 }
 
-fn run_hidden_commands(commands: &[String], env: &HashMap<String, String>) {
+fn run_hidden_commands(commands: &[String], env_state: &mut HashMap<String, String>) {
     for cmd in commands {
-        let status = Command::new("sh")
-            .arg("-c")
-            .arg(cmd)
-            .envs(env)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
+        let before = env_state.clone();
+        let status = shell_status_with_env_snapshot(
+            cmd,
+            env_state,
+            Stdio::null(),
+            Stdio::null(),
+            Stdio::null(),
+        );
 
-        if let Ok(s) = status {
+        if let Ok((s, snapshot)) = status {
+            persist_env_snapshot(env_state, &before, &HashMap::new(), snapshot);
             if !s.success() {
                 eprintln!(
                     "[demonator] setup/teardown command failed ({}): {}",
@@ -1031,7 +1233,7 @@ struct ResolvedStep {
 enum StepRef {
     Directive(String),
     Comment(String, Option<String>),
-    Ask(String, String),            // (message, capture_name)
+    Ask(String, String),                   // (message, capture_name)
     Input(String, String, Option<String>), // (message, capture_name, default)
     Command(CommandRef),
 }
@@ -1166,10 +1368,7 @@ fn print_dry_run(config: &Config) {
     for (i, resolved) in demo.steps.iter().enumerate() {
         // Check chapter boundary
         if chapter_idx < demo.chapters.len() && demo.chapters[chapter_idx].start == i {
-            println!(
-                "\x1B[1;36m── {} ──\x1B[0m",
-                demo.chapters[chapter_idx].name
-            );
+            println!("\x1B[1;36m── {} ──\x1B[0m", demo.chapters[chapter_idx].name);
             chapter_idx += 1;
         }
 
@@ -1282,9 +1481,11 @@ fn load_config(path: &Path) -> Config {
 // ---------------------------------------------------------------------------
 
 fn run_demo(config: &Config, cli: &Cli) {
+    let mut runtime_env = initial_env(&config.env);
+
     // Setup
     if let Some(ref setup) = config.setup {
-        run_hidden_commands(setup, &config.env);
+        run_hidden_commands(setup, &mut runtime_env);
     }
 
     // Dry run
@@ -1386,25 +1587,29 @@ fn run_demo(config: &Config, cli: &Cli) {
 
             StepRef::Command(cmd) => {
                 // Evaluate conditionals
-                let should_run = {
-                    let mut run = true;
-                    if let Some(ref var_name) = cmd.if_condition {
-                        match vars.get(var_name) {
-                            Some(v) if !v.trim().is_empty() => {}
-                            _ => run = false,
-                        }
-                    }
-                    if let Some(ref var_name) = cmd.unless {
-                        if let Some(v) = vars.get(var_name) {
-                            if !v.trim().is_empty() {
-                                run = false;
-                            }
-                        }
-                    }
-                    run
+                let cmd_for_conditions = CommandStep {
+                    text: cmd.text.clone(),
+                    speed: cmd.speed,
+                    delay: cmd.delay,
+                    jitter: cmd.jitter,
+                    pause: cmd.pause,
+                    capture: None,
+                    fake_output: cmd.fake_output.clone(),
+                    output_speed: cmd.output_speed,
+                    execute: cmd.execute,
+                    wait_for: cmd.wait_for.clone(),
+                    timeout: cmd.timeout,
+                    wait: cmd.wait,
+                    interact: None,
+                    if_condition: cmd.if_condition.clone(),
+                    unless: cmd.unless.clone(),
+                    wait_before: cmd.wait_before,
+                    wait_after: cmd.wait_after,
+                    env: cmd.env.clone(),
+                    hidden: cmd.hidden,
                 };
 
-                if !should_run {
+                if !should_run_step(&cmd_for_conditions, &vars) {
                     idx += 1;
                     continue;
                 }
@@ -1413,20 +1618,17 @@ fn run_demo(config: &Config, cli: &Cli) {
 
                 if cmd.hidden {
                     // Run silently — no prompt, no typing, no output, no wait
-                    let mut step_env: HashMap<String, String> = config.env.clone();
-                    for (k, v) in &cmd.env {
-                        step_env.insert(k.clone(), v.clone());
-                    }
+                    let before_env = runtime_env.clone();
+                    let step_env = merge_env(&runtime_env, &cmd.env);
                     if let Some(ref cap) = cmd.capture {
-                        if let Ok(output) = Command::new("sh")
-                            .arg("-c")
-                            .arg(&resolved_text)
-                            .envs(&step_env)
-                            .stdin(Stdio::null())
-                            .stdout(Stdio::piped())
-                            .stderr(Stdio::null())
-                            .output()
-                        {
+                        if let Ok((output, snapshot)) = shell_output_with_env_snapshot(
+                            &resolved_text,
+                            &step_env,
+                            Stdio::null(),
+                            Stdio::piped(),
+                            Stdio::null(),
+                        ) {
+                            persist_env_snapshot(&mut runtime_env, &before_env, &cmd.env, snapshot);
                             let stdout_str = String::from_utf8_lossy(&output.stdout);
                             let value = if let Some(ref jp) = cap.json_path {
                                 extract_json_path(&stdout_str, jp)
@@ -1444,14 +1646,15 @@ fn run_demo(config: &Config, cli: &Cli) {
                             }
                         }
                     } else {
-                        let _ = Command::new("sh")
-                            .arg("-c")
-                            .arg(&resolved_text)
-                            .envs(&step_env)
-                            .stdin(Stdio::null())
-                            .stdout(Stdio::null())
-                            .stderr(Stdio::null())
-                            .status();
+                        if let Ok((_status, snapshot)) = shell_status_with_env_snapshot(
+                            &resolved_text,
+                            &step_env,
+                            Stdio::null(),
+                            Stdio::null(),
+                            Stdio::null(),
+                        ) {
+                            persist_env_snapshot(&mut runtime_env, &before_env, &cmd.env, snapshot);
+                        }
                     }
                     idx += 1;
                     continue;
@@ -1465,11 +1668,7 @@ fn run_demo(config: &Config, cli: &Cli) {
                     wait_for_enter_silent();
                 }
 
-                let base_delay = if let Some(speed) = cmd.speed.or(config.speed) {
-                    speed_to_delay(speed)
-                } else {
-                    cmd.delay.unwrap_or(config.delay)
-                };
+                let base_delay = resolve_delay(&cmd_for_conditions, config);
                 let jitter_val = cmd.jitter.unwrap_or(config.jitter);
                 let pause_val = cmd.pause.unwrap_or(config.pause);
 
@@ -1490,11 +1689,7 @@ fn run_demo(config: &Config, cli: &Cli) {
                     // Handle navigation
                     match &action {
                         NavAction::NextChapter => {
-                            if let Some(next) = demo
-                                .chapters
-                                .iter()
-                                .find(|c| c.start > idx)
-                            {
+                            if let Some(next) = demo.chapters.iter().find(|c| c.start > idx) {
                                 idx = next.start;
                                 // Recalculate chapter_idx
                                 chapter_idx = demo
@@ -1507,10 +1702,8 @@ fn run_demo(config: &Config, cli: &Cli) {
                         }
                         NavAction::PrevChapter => {
                             // Find the chapter that contains the current step
-                            let current_chapter = demo
-                                .chapters
-                                .iter()
-                                .rposition(|c| c.start <= idx);
+                            let current_chapter =
+                                demo.chapters.iter().rposition(|c| c.start <= idx);
                             if let Some(ci) = current_chapter {
                                 if ci > 0 {
                                     idx = demo.chapters[ci - 1].start;
@@ -1530,17 +1723,13 @@ fn run_demo(config: &Config, cli: &Cli) {
                                 continue;
                             }
                         }
-                        NavAction::Continue => {}
+                        NavAction::Continue => {
+                            println!();
+                        }
                     }
                     action
                 };
                 let _ = nav;
-
-                // Merge global + per-step env (per-step wins)
-                let mut step_env: HashMap<String, String> = config.env.clone();
-                for (k, v) in &cmd.env {
-                    step_env.insert(k.clone(), v.clone());
-                }
 
                 // Execute the command
                 if let Some(ref fake) = cmd.fake_output {
@@ -1556,19 +1745,28 @@ fn run_demo(config: &Config, cli: &Cli) {
 
                     if cmd.execute {
                         // Also run the real command (output is hidden since fake is shown)
-                        let _ = Command::new("sh")
-                            .arg("-c")
-                            .arg(&resolved_text)
-                            .envs(&step_env)
-                            .stdin(Stdio::null())
-                            .stdout(Stdio::null())
-                            .stderr(Stdio::null())
-                            .status();
+                        let before_env = runtime_env.clone();
+                        let step_env = merge_env(&runtime_env, &cmd.env);
+                        if let Ok((_status, snapshot)) = shell_status_with_env_snapshot(
+                            &resolved_text,
+                            &step_env,
+                            Stdio::null(),
+                            Stdio::null(),
+                            Stdio::null(),
+                        ) {
+                            persist_env_snapshot(&mut runtime_env, &before_env, &cmd.env, snapshot);
+                        }
                     }
                 } else if !cmd.execute {
                     // No execution, no fake output — just typed the command
                 } else if let Some(ref pattern) = cmd.wait_for {
-                    run_command_wait_for(&resolved_text, pattern, cmd.timeout, &step_env);
+                    run_command_wait_for(
+                        &resolved_text,
+                        pattern,
+                        cmd.timeout,
+                        &mut runtime_env,
+                        &cmd.env,
+                    );
                 } else if let Some(ref interactions) = cmd.interact {
                     let interaction_refs: Vec<Interaction> = interactions
                         .iter()
@@ -1577,15 +1775,24 @@ fn run_demo(config: &Config, cli: &Cli) {
                             send: i.send.clone(),
                         })
                         .collect();
-                    run_command_interact(&resolved_text, &interaction_refs, &step_env);
+                    run_command_interact(
+                        &resolved_text,
+                        &interaction_refs,
+                        &mut runtime_env,
+                        &cmd.env,
+                    );
                 } else {
                     let capture_ref = cmd.capture.as_ref().map(|c| Capture {
                         name: c.name.clone(),
                         pattern: c.pattern.clone(),
                         json_path: c.json_path.clone(),
                     });
-                    let (captured, _code) =
-                        run_command(&resolved_text, capture_ref.as_ref(), &step_env);
+                    let (captured, _code) = run_command(
+                        &resolved_text,
+                        capture_ref.as_ref(),
+                        &mut runtime_env,
+                        &cmd.env,
+                    );
                     if let Some(value) = captured {
                         if let Some(ref cap) = cmd.capture {
                             vars.insert(cap.name.clone(), value);
@@ -1608,7 +1815,7 @@ fn run_demo(config: &Config, cli: &Cli) {
 
     // Teardown
     if let Some(ref teardown) = config.teardown {
-        run_hidden_commands(teardown, &config.env);
+        run_hidden_commands(teardown, &mut runtime_env);
     }
 }
 
@@ -1981,10 +2188,7 @@ steps:
     #[test]
     fn test_extract_json_path_simple_key() {
         let json = r#"{"name": "hello"}"#;
-        assert_eq!(
-            extract_json_path(json, "name"),
-            Some("hello".to_string())
-        );
+        assert_eq!(extract_json_path(json, "name"), Some("hello".to_string()));
     }
 
     #[test]
@@ -2101,6 +2305,37 @@ steps:
         let config: Config = serde_yaml::from_str(yaml).unwrap();
         assert_eq!(config.setup.as_ref().unwrap().len(), 2);
         assert_eq!(config.teardown.as_ref().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn test_exported_env_persists_between_commands() {
+        let mut env_state = HashMap::new();
+        let overlay = HashMap::new();
+
+        let (_captured, code) = run_command(
+            "export DEMONATOR_TEST_TOKEN=s3cr3t_t0k3n",
+            None,
+            &mut env_state,
+            &overlay,
+        );
+        assert_eq!(code, 0);
+        assert_eq!(
+            env_state.get("DEMONATOR_TEST_TOKEN").map(String::as_str),
+            Some("s3cr3t_t0k3n")
+        );
+
+        let (captured, code) = run_command(
+            "printf '%s' \"$DEMONATOR_TEST_TOKEN\"",
+            Some(&Capture {
+                name: "token".to_string(),
+                pattern: Some("(.*)".to_string()),
+                json_path: None,
+            }),
+            &mut env_state,
+            &overlay,
+        );
+        assert_eq!(code, 0);
+        assert_eq!(captured.as_deref(), Some("s3cr3t_t0k3n"));
     }
 
     #[test]
